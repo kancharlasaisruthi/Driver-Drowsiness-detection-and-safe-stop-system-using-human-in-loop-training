@@ -27,7 +27,6 @@ def shape_to_np(shape: dlib.full_object_detection, dtype: type = "int") -> np.nd
         coords[i] = (shape.part(i).x, shape.part(i).y)
     return coords
 
-
 # ─────────────────────────────────────────────
 #  EAR Helper
 # ─────────────────────────────────────────────

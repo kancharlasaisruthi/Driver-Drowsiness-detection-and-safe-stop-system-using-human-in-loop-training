@@ -1,3 +1,25 @@
+"""
+run_drowsy.py
+--------------
+Normal driving  → pretrained RL model controls the car.
+Drowsy detected → A self-contained PID (replicating LaneChangePolicy's
+                  internal logic) steers the car to the rightmost lane,
+                  then brakes to a stop.
+Eyes reopen     → RL immediately resumes.
+
+Why not use LaneChangePolicy directly?
+  LaneChangePolicy asserts discrete_action=True at construction time.
+  HumanInTheLoopEnv uses continuous actions, so the assert always fires.
+  Solution: replicate the same PID logic here without the assert.
+
+The PID works like LaneChangePolicy does internally:
+  - Identify the target lane (rightmost = highest lane index)
+  - Compute lateral offset of vehicle from target lane centre
+  - Compute heading error relative to road direction
+  - PID on (lateral_error + heading_error) → steering
+  - Speed control → throttle/brake
+"""
+
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
@@ -10,7 +32,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from collections import OrderedDict
 from enum import Enum, auto
-import json
 
 # ── Project paths ─────────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -47,7 +68,6 @@ LANDMARK_PATH = os.path.join(PROJECT_ROOT, "env_gym",
 NUM_EPISODES           = 6
 MAX_STEPS              = 2000
 DROWSY_CONFIRM_SECONDS = 2.0
-CUMULATIVE_STATS_FILE  = "cumulative_stats.json"
 
 # PID gains (same order of magnitude as MetaDrive's LaneChangePolicy)
 PID_KP_LAT  = 0.5   # proportional gain on lateral error
@@ -59,37 +79,6 @@ BRAKE_SPEED_KMH       = 3.0    # target speed while braking in rightmost lane
 STOP_SPEED_KMH        = 0.5    # considered stopped below this
 
 BEEP_INTERVAL = 2.0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Cumulative stats persistence
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_cumulative_stats():
-    if os.path.exists(CUMULATIVE_STATS_FILE):
-        with open(CUMULATIVE_STATS_FILE, 'r') as f:
-            data = json.load(f)
-        return {
-            "outcomes": data.get("outcomes", {"drowsy_success": 0, "crash": 0, "out_of_road": 0, "timeout": 0, "normal_done": 0}),
-            "total_drowsy_events": data.get("total_drowsy_events", 0),
-            "all_lane_change_times": data.get("all_lane_change_times", []),
-            "total_episodes": data.get("total_episodes", 0),
-            "max_reward": data.get("max_reward", float('-inf')),
-            "min_reward": data.get("min_reward", float('inf'))
-        }
-    else:
-        return {
-            "outcomes": {"drowsy_success": 0, "crash": 0, "out_of_road": 0, "timeout": 0, "normal_done": 0},
-            "total_drowsy_events": 0,
-            "all_lane_change_times": [],
-            "total_episodes": 0,
-            "max_reward": float('-inf'),
-            "min_reward": float('inf')
-        }
-
-def save_cumulative_stats(stats):
-    with open(CUMULATIVE_STATS_FILE, 'w') as f:
-        json.dump(stats, f, indent=4)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -397,44 +386,17 @@ def get_rl_action(policy, obs):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Episode success logic
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _classify_episode(done, info, drowsy_state, env):
-    """
-    Returns one of: 'drowsy_success', 'crash', 'out_of_road', 'timeout', 'normal_done'
-    
-    drowsy_success = vehicle stopped in rightmost lane while drowsy.
-    This is the PRIMARY success criterion – reaching route end is NOT required.
-    """
-    if drowsy_state == DrowsyState.STOPPED:
-        return "drowsy_success"
-    if done:
-        crash_keys = {'crash_vehicle', 'crash_object', 'crash_human'}
-        if any(info.get(k, False) for k in crash_keys):
-            return "crash"
-        if info.get("out_of_road", False):
-            return "out_of_road"
-        return "normal_done"
-    return "timeout"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("=" * 64)
-    print("  Drowsy Driver Safety System")
-    print("  ─────────────────────────────────────────────────────────")
+    print("=" * 60)
+    print("  Drowsy Driver — RL + LaneChangePolicy-style PID")
     print("  AWAKE  : pretrained RL model drives")
-    print("  DROWSY : PID steering to rightmost lane then stops")
-    print("  SUCCESS: vehicle stopped in rightmost lane")
-    print("=" * 64 + "\n")
-
-    # Load cumulative stats
-    cum_stats = load_cumulative_stats()
-    print(f"[RunDrowsy] Loaded cumulative stats: {cum_stats['total_episodes']} previous episodes\n")
+    print("  DROWSY : PID (mirrors LaneChangePolicy internals)")
+    print("           steers to rightmost lane then stops")
+    print("  AWAKE  : RL immediately resumes")
+    print("=" * 60 + "\n")
 
     env = HumanInTheLoopEnv()
     env.use_drowsy_reward = True 
@@ -455,8 +417,7 @@ def main():
 
     episode_rewards       = []
     episode_lengths       = []
-    outcomes              = {"drowsy_success": 0, "crash": 0,
-                             "out_of_road": 0, "timeout": 0, "normal_done": 0}
+    successes = crashes = out_of_roads = 0
     total_drowsy_events   = 0
     all_lane_change_times = []
 
@@ -466,7 +427,6 @@ def main():
                 obs = env.reset()
             drowsy.reset()
             ep_reward = 0.0
-            ep_outcome = "timeout"
             env.external_reward = 0
             print(f"\n─── Episode {episode + 1} / {NUM_EPISODES} ───")
 
@@ -482,110 +442,42 @@ def main():
                     lane  = getattr(env.agent, "lane_index", ("?", "?", "?"))[2]
                     print(f"  step={step:4d} | state={state_name:14s} | "
                           f"EAR={ear:.3f} | lane={lane} | "
-                          f"speed={speed:.1f} km/h | r={reward:+.3f}")
-
-                # Check for drowsy success first (takes priority over env done)
-                if drowsy.state == DrowsyState.STOPPED:
-                    ep_outcome = "drowsy_success"
-                    print(f"  ✓ DROWSY SUCCESS at step {step} | reward={ep_reward:.2f}")
-                    break
-
+                          f"speed={speed:.1f} km/h | reward={reward:+.3f}")
                 if done:
-                    ep_outcome = _classify_episode(done, info, drowsy.state, env)
-                    print(f"  Episode ended: {ep_outcome} at step {step} | "
-                          f"reward={ep_reward:.2f}")
+                    print(f"  Done at step {step}. Reward={ep_reward:.2f}")
                     break
             else:
-                ep_outcome = "timeout"
-                print(f"  Timeout. reward={ep_reward:.2f}")
+                print(f"  Max steps. Reward={ep_reward:.2f}")
 
             episode_rewards.append(ep_reward)
             episode_lengths.append(step + 1)
-            outcomes[ep_outcome] = outcomes.get(ep_outcome, 0) + 1
+            crash_keys = {'crash_vehicle', 'crash_object', 'crash_human'}
+            is_crash   = done and any(info.get(k, False) for k in crash_keys)
+            is_oor     = done and info.get('out_of_road', False)
+            if is_crash:              crashes += 1
+            if is_oor:                out_of_roads += 1
+            if not is_crash and not is_oor: successes += 1
             total_drowsy_events   += drowsy.drowsy_events
             all_lane_change_times += drowsy.lane_change_times
 
-        # Update cumulative stats
-        for key in cum_stats["outcomes"]:
-            cum_stats["outcomes"][key] += outcomes[key]
-        cum_stats["total_drowsy_events"] += total_drowsy_events
-        cum_stats["all_lane_change_times"].extend(all_lane_change_times)
-        cum_stats["total_episodes"] += NUM_EPISODES
-        
-        # Update max/min rewards
-        if episode_rewards:
-            current_max = max(episode_rewards)
-            current_min = min(episode_rewards)
-            cum_stats["max_reward"] = max(cum_stats["max_reward"], current_max)
-            cum_stats["min_reward"] = min(cum_stats["min_reward"], current_min)
+        print("\n" + "=" * 60)
+        print("  SUMMARY")
+        print("=" * 60)
+        print(f"  Episodes         : {NUM_EPISODES}")
+        print(f"  Success rate     : {successes/NUM_EPISODES*100:.1f}%")
+        print(f"  Crash rate       : {crashes/NUM_EPISODES*100:.1f}%")
+        print(f"  Out-of-road      : {out_of_roads/NUM_EPISODES*100:.1f}%")
+        print(f"  Avg reward       : {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}")
+        print(f"  Drowsy events    : {total_drowsy_events}")
+        if all_lane_change_times:
+            print(f"  Avg override time: {np.mean(all_lane_change_times):.2f}s")
 
-        # Save cumulative stats
-        save_cumulative_stats(cum_stats)
-        print(f"[RunDrowsy] Updated cumulative stats saved to {CUMULATIVE_STATS_FILE}")
-
-        # ── Cumulative Summary ───────────────────────────────────────────────
-        print("\n" + "=" * 64)
-        print("  CUMULATIVE SUMMARY (All Runs)")
-        print("=" * 64)
-        total_eps = cum_stats["total_episodes"]
-        ds  = cum_stats["outcomes"]["drowsy_success"]
-        cr  = cum_stats["outcomes"]["crash"]
-        oor = cum_stats["outcomes"]["out_of_road"]
-        nd  = cum_stats["outcomes"]["normal_done"]
-        to_ = cum_stats["outcomes"]["timeout"]
-        print(f"  Total Episodes      : {total_eps}")
-        print(f"  Drowsy success rate : {ds/total_eps*100:.1f}%  "
-              f"({ds}/{total_eps})")
-        print(f"  Crash rate          : {cr/total_eps*100:.1f}%")
-        print(f"  Out-of-road rate    : {oor/total_eps*100:.1f}%")
-        print(f"  Normal done         : {nd/total_eps*100:.1f}%")
-        print(f"  Timeout             : {to_/total_eps*100:.1f}%")
-        print(f"  Drowsy events total : {cum_stats['total_drowsy_events']}")
-        if cum_stats["all_lane_change_times"]:
-            print(f"  Avg override time   : {np.mean(cum_stats['all_lane_change_times']):.2f}s")
-        print(f"  Highest reward      : {cum_stats['max_reward']:.2f}")
-        print(f"  Lowest reward       : {cum_stats['min_reward']:.2f}")
-        if cum_stats["max_reward"] != float('-inf') and cum_stats["min_reward"] != float('inf'):
-            print(f"  Reward range        : {cum_stats['max_reward'] - cum_stats['min_reward']:.2f}")
-
-        # ── Plot (current run only, for simplicity) ─────────────────────────
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-        axes[0].plot(episode_rewards, marker='o', color='steelblue')
-        axes[0].set_xlabel("Episode")
-        axes[0].set_ylabel("Total Reward")
-        axes[0].set_title("Episode Rewards (This Run)")
-        axes[0].grid(True)
-
-        labels = list(outcomes.keys())
-        values = [outcomes[k] for k in labels]
-        axes[1].bar(labels, values, color=['green', 'red', 'orange', 'blue', 'gray'])
-        axes[1].set_title("Episode Outcomes (This Run)")
-        axes[1].set_ylabel("Count")
-        axes[1].tick_params(axis='x', rotation=20)
-
-        plt.tight_layout()
-        plt.savefig("episode_results.png")
-        
-        # ── Current run summary ─────────────────────────────────────────────
-        print("\n" + "=" * 64)
-        print("  THIS RUN SUMMARY")
-        print("=" * 64)
-        ds  = outcomes["drowsy_success"]
-        cr  = outcomes["crash"]
-        oor = outcomes["out_of_road"]
-        nd  = outcomes["normal_done"]
-        to_ = outcomes["timeout"]
-        print(f"  Episodes            : {NUM_EPISODES}")
-        print(f"  Drowsy success rate : {ds/NUM_EPISODES*100:.1f}%  ")
-        print(f"  Crash rate          : {cr/NUM_EPISODES*100:.1f}%")
-        print(f"  Out-of-road rate    : {oor/NUM_EPISODES*100:.1f}%")
-        print(f"  Avg reward          : {np.mean(episode_rewards):.2f}")
-        print(f"  Highest reward      : {max(episode_rewards):.2f}")
-        print(f"  Lowest reward       : {min(episode_rewards):.2f}")
-        print(f"  Reward range        : {max(episode_rewards) - min(episode_rewards):.2f}")
-        
-        print("\nPlot saved → episode_results.png")
+        plt.figure(figsize=(10, 4))
+        plt.plot(episode_rewards, marker='o')
+        plt.xlabel("Episode"); plt.ylabel("Reward")
+        plt.title("Episode Rewards"); plt.grid(True); plt.tight_layout()
+        plt.savefig("episode_rewards.png")
+        print("\nPlot → episode_rewards.png")
 
     finally:
         drowsy.stop()

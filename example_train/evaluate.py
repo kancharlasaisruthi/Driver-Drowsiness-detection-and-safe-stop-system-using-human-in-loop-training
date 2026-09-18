@@ -191,7 +191,7 @@ if __name__ == "__main__":
 
     #parser.add_argument("--buffer_path", type=str, default= "/home/carla/LZQW/DSAC-T-EGPO-V2/results/DSAC_V2_PVP_RL_gym_metadrivepvp/fixed2/buf_25000.pkl")
     #parser.add_argument("--human_buffer_path", type=str, default= "/home/carla/LZQW/DSAC-T-EGPO-V2/results/DSAC_V2_PVP_RL_gym_metadrivepvp/fixed2/human_buf_20000.pkl")
-    parser.add_argument("--buffer_path", type=str, default= 'C:/Users/saika/minor_project/C-HAC/results/DSAC_V2_PVP_RL_gym_metadrivepvp/260128-222729/buf_177.pkl')
+    parser.add_argument("--buffer_path", type=str, default= 'C:/Users/saika/minor_project/C-HAC/results/DSAC_V2_PVP_RL_gym_metadrivepvp/260128-222729/buf_228.pkl')
     #
     parser.add_argument("--human_buffer_path", type=str, default= "C:/Users/saika/minor_project/C-HAC/results/DSAC_V2_PVP_RL_gym_metadrivepvp/260128-222729/apprfunc/human_buf_17000.pkl")
 
@@ -226,8 +226,8 @@ if __name__ == "__main__":
         "policy_hidden_sizes": [256, 256, 256],
 
         # pretrained model
-        "ini_network_dir": r"C:\Users\saika\minor_project\C-HAC\results\DSAC_V2_PVP_RL_gym_metadrivepvp\260128-222729\apprfunc\apprfunc_124000.pkl",
-        "ini_network_iter": 124000,
+        "ini_network_dir": r"C:\Users\saika\minor_project\C-HAC\results\DSAC_V2_PVP_RL_gym_metadrivepvp\260128-222729\apprfunc\apprfunc_73000.pkl",
+        "ini_network_iter": 73000,
     }
 
     # ======================

@@ -22,6 +22,7 @@ ScreenMessage.SCALE = 0.1
 
 
 HUMAN_IN_THE_LOOP_ENV_CONFIG = {
+   
 
     "record_video":False,
     "video_folder":'./video',
@@ -36,7 +37,7 @@ HUMAN_IN_THE_LOOP_ENV_CONFIG = {
     "speed_reward": 1.0,
     "use_lateral_reward":True,
     "success_reward" : 50.0,
-    "map": "CTO",
+    "map": "CTOWN",
     "out_of_road_penalty" : 30.0,
     # "on_lane_line_penalty" : 5.,
     "crash_vehicle_penalty" : 30.0,
@@ -59,7 +60,7 @@ HUMAN_IN_THE_LOOP_ENV_CONFIG = {
     "out_of_route_done": False,  # Raise done if out of route.
     "num_scenarios": 1000,  # Number of scenarios to be used.
     "start_seed":548,
-    "traffic_density": 0.09,  # Density of the background traffic vehicles.
+    "traffic_density": 0.08,  # Density of the background traffic vehicles.
     
     "render_mode": "onscreen",
     'people_density': 0.08,  # Density of pedestrians in the environment.
@@ -113,6 +114,8 @@ class HumanInTheLoopEnv(SafeMetaDriveEnv):
     use_rl=True
     activate_rl=True
     start_time = time.time()
+    use_drowsy_reward = False
+    external_reward = 0.0
 
     def default_config(self):
         config = super(HumanInTheLoopEnv, self).default_config()
@@ -174,16 +177,20 @@ class HumanInTheLoopEnv(SafeMetaDriveEnv):
             self.engine.taskMgr.step()
         self.takeover_recorder.append(self.takeover)
         if self.config["use_render"]:  # and self.config["main_exp"]: #and not self.config["in_replay"]:
+            display_reward = self.external_reward if self.use_drowsy_reward else ret[1]
             super(HumanInTheLoopEnv, self).render(
                 text={
                     'speed': "{:.2f} km/h".format(self.agent.speed_km_h),
                     "Takeover": "TAKEOVER" if self.takeover else "NO",
                     "Total Step": self.total_steps,
-                    "Total Time": time.strftime("%M:%S", time.gmtime(time.time() - self.start_time)),
+                    #"Total Time": time.strftime("%M:%S", time.gmtime(time.time() - self.start_time)),
                     "Takeover rate": "{:.2f}%".format(np.mean(np.array(self.takeover_recorder) * 100)),
                     #'Total Cost': "{:.3f}".format(self.total_cost),
-                    'activate rl': "True" if self.activate_rl else "False",
-                    'use rl': "True" if self.use_rl else "False"
+                    #'activate rl': "True" if self.activate_rl else "False",
+                    'use rl': "True" if self.use_rl else "False",
+                    
+
+                    'reward': "{:.2f}".format(display_reward),
                     
                 }
             )
@@ -229,6 +236,7 @@ def spawn_cubes():
 
 if __name__=="__main__":
     env = HumanInTheLoopEnv()
+    
     o=env.reset()
     
 

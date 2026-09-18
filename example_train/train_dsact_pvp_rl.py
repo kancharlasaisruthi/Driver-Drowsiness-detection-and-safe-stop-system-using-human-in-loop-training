@@ -109,7 +109,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ini_network_dir",
         type=str,
-        default='C:\\Users\\saika\\minor_project\\C-HAC\\results\\DSAC_V2_PVP_RL_gym_metadrivepvp\\260128-222729\\apprfunc\\apprfunc_88000.pkl',#fixed1
+        default='C:\\Users\\saika\\minor_project\\C-HAC\\results\\DSAC_V2_PVP_RL_gym_metadrivepvp\\260128-222729\\apprfunc\\apprfunc_93000.pkl',#fixed1
         #default="C:/Users/saika/minor_project/C-HAC/results/DSAC_V2_PVP_RL_gym_metadrivepvp/260128-222729/apprfunc"
        
     )
@@ -118,7 +118,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ini_network_iter",
         type=int,
-        default=88000,#fixed1
+        default=93000,#fixed1
         # default=45000,  # fixed2
     )
 

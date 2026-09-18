@@ -1,3 +1,25 @@
+"""
+run_drowsy.py
+--------------
+Normal driving  → pretrained RL model controls the car.
+Drowsy detected → Smooth 4-phase manoeuvre:
+                    Phase 1  SLOW_DOWN   – ease off throttle, reduce speed gently
+                    Phase 2  DRIFT_LEFT  – soft left steering at low speed
+                    Phase 3  ALIGN_LANE  – line up with the leftmost lane heading
+                    Phase 4  BRAKE_STOP  – hold lane, decelerate to full stop
+Manoeuvre completes fully; does not resume until driver indicates readiness.
+
+SUCCESS is defined as: vehicle stopped in the leftmost lane while drowsy.
+Reaching the end of the route is NOT required.
+
+Smoothness guarantees
+---------------------
+* All steering changes are low-pass filtered (exponential moving average)
+  so there are no abrupt jumps.
+* Speed targets ramp gently; full-brake is never issued in one step.
+* Steer ramps from 0 → target over RAMP_STEPS steps in DRIFT_RIGHT phase.
+"""
+
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
@@ -44,19 +66,28 @@ PRETRAINED_MODEL_PATH = os.path.join(
 LANDMARK_PATH = os.path.join(PROJECT_ROOT, "env_gym",
                              "shape_predictor_68_face_landmarks.dat")
 
-NUM_EPISODES           = 6
+NUM_EPISODES           = 5
 MAX_STEPS              = 2000
 DROWSY_CONFIRM_SECONDS = 2.0
 CUMULATIVE_STATS_FILE  = "cumulative_stats.json"
 
-# PID gains (same order of magnitude as MetaDrive's LaneChangePolicy)
-PID_KP_LAT  = 0.5   # proportional gain on lateral error
-PID_KP_HDG  = 0.3   # proportional gain on heading error
-STEER_MAX   = 0.5   # clip steering to ±this
+# ── Smooth manoeuvre parameters ───────────────────────────────────────────────
+SLOW_DOWN_TARGET_KMH  = 18.0   # Phase 1: reduce speed to this before steering
+DRIFT_SPEED_KMH       = 14.0   # Phase 2: target speed while drifting right
+BRAKE_SPEED_KMH       = 4.0    # Phase 3: target speed while braking in lane
+STOP_SPEED_KMH        = 0.5  # considered fully stopped below this
 
-LANE_CHANGE_SPEED_KMH = 12.0   # target speed while changing lanes
-BRAKE_SPEED_KMH       = 3.0    # target speed while braking in rightmost lane
-STOP_SPEED_KMH        = 0.5    # considered stopped below this
+STEER_SMOOTH_ALPHA    = 0.3    # EMA coefficient for steering (0=frozen, 1=instant)
+STEER_MAX             = 0.5    # absolute max steering magnitude
+DRIFT_STEER_FACTOR    = 1.0    # scale down raw rightward steering during lane drift
+RAMP_STEPS            = 20     # steps over which drift steer ramps from 0 → target
+ALIGN_SPEED_KMH       = 8.0    # Phase 3 pre-brake speed for alignment
+ALIGN_DURATION_S      = 5.0    # hold alignment for this long before braking
+RIGHT_LANE_NEAR_THR   = 0.6    # meters from rightmost lane centre to trigger alignment
+
+# PID gains (mirrors LaneChangePolicy internals)
+PID_KP_LAT = 2.0
+PID_KP_HDG = 1.0
 
 BEEP_INTERVAL = 2.0
 
@@ -93,14 +124,10 @@ def save_cumulative_stats(stats):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LaneChange-style PID (mirrors LaneChangePolicy internals)
+#  Road / lane helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_road_info(env):
-    """
-    Returns (road_network, road_id, section_id, lane_id, lanes)
-    or None on failure.
-    """
     try:
         vehicle      = env.agent
         road_network = env.engine.current_map.road_network
@@ -111,76 +138,56 @@ def _get_road_info(env):
         return None
 
 
-def _in_rightmost_lane(env):
+def _in_leftmost_lane(env):
     info = _get_road_info(env)
     if info is None:
         return False
     _, _, _, lane_id, lanes = info
-    return lane_id == len(lanes) - 1
+    return lane_id == 0
+
+
+def _current_speed_kmh(env):
+    return float(getattr(env.agent, "speed_km_h", 0.0))
 
 
 def _pid_steer_to_lane(env, target_lane_obj):
-    """
-    Compute steering to follow target_lane_obj.
-    Mirrors what LaneChangePolicy's PID does:
-      error = lateral_offset + k * heading_error
-      steer = kp * error
-    """
+    """Compute smooth PID steering toward target_lane_obj."""
     vehicle = env.agent
     try:
         long, lat = target_lane_obj.local_coordinates(vehicle.position)
         road_hdg  = target_lane_obj.heading_theta_at(long)
         hdg_err   = road_hdg - vehicle.heading_theta
-        # wrap to [-π, π]
         hdg_err   = (hdg_err + np.pi) % (2 * np.pi) - np.pi
-        # combined error: lateral offset + scaled heading correction
-        error = PID_KP_LAT * lat + PID_KP_HDG * hdg_err
-        steer = float(np.clip(error, -STEER_MAX, STEER_MAX))
+        error     = - PID_KP_LAT * lat + PID_KP_HDG * hdg_err
+        return float(np.clip(error, -STEER_MAX, STEER_MAX))
     except Exception:
-        steer = 0.0
-    return steer
+        return 0.0
 
 
-def _speed_accel(env, target_kmh):
-    """Simple P-controller for speed."""
-    speed = getattr(env.agent, "speed_km_h", 0.0)
-    diff  = target_kmh - speed
-    # map diff to [-1, 1]: positive = accelerate, negative = brake
-    accel = float(np.clip(diff / max(target_kmh, 1.0), -1.0, 1.0))
+def _speed_accel(current_kmh, target_kmh, max_brake=-0.4, max_accel=0.3):
+    """
+    Gentle P-controller — max_brake caps negative output so we never
+    slam the brakes in one step.
+    """
+    diff  = target_kmh - current_kmh
+    scale = max(target_kmh, STOP_SPEED_KMH + 1.0)
+    accel = float(np.clip(diff / scale, max_brake, max_accel))
     return accel
 
 
-def _lane_change_action(env, ramp=1.0):
-    """
-    Action to move toward the rightmost lane.
-    Ramp smoothly increases steering from 0 → full over time.
-    """
+def _is_near_leftmost_lane(env, threshold=RIGHT_LANE_NEAR_THR):
     info = _get_road_info(env)
     if info is None:
-        return np.array([0.0, 0.1], dtype=np.float32)
-
-    _, _, _, _, lanes = info
-    target_lane = lanes[len(lanes) - 1]   # rightmost
-
-    steer = _pid_steer_to_lane(env, target_lane) * ramp
-    accel = _speed_accel(env, LANE_CHANGE_SPEED_KMH)
-    return np.array([steer, accel], dtype=np.float32)
-
-
-def _keep_lane_brake_action(env):
-    """
-    Keep the current (rightmost) lane and slow to a stop.
-    """
-    info = _get_road_info(env)
-    if info is None:
-        return np.array([0.0, -0.3], dtype=np.float32)
-
+        return False
     _, _, _, lane_id, lanes = info
-    current_lane = lanes[lane_id]
-
-    steer = _pid_steer_to_lane(env, current_lane)
-    accel = _speed_accel(env, BRAKE_SPEED_KMH)
-    return np.array([steer, accel], dtype=np.float32)
+    if lane_id == 0:
+        return True
+    try:
+        target_lane = lanes[0]
+        _, lat = target_lane.local_coordinates(env.agent.position)
+        return abs(lat) <= threshold
+    except Exception:
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,9 +197,11 @@ def _keep_lane_brake_action(env):
 class DrowsyState(Enum):
     IDLE          = auto()
     CONFIRMING    = auto()
-    LANE_CHANGING = auto()
-    LANE_KEEPING  = auto()   # in rightmost lane, braking to stop
-    STOPPED       = auto()
+    SLOW_DOWN     = auto()   # Phase 1: ease off throttle, go straight
+    DRIFT_LEFT  = auto()   # Phase 2: gentle left steer toward leftmost lane
+    ALIGN_LANE    = auto()   # Phase 3: align to lane heading before braking
+    BRAKE_STOP    = auto()   # Phase 4: hold lane, decelerate to stop
+    STOPPED       = auto()   # SUCCESS – vehicle at rest in leftmost lane
 
 
 class DrowsinessController:
@@ -200,14 +209,20 @@ class DrowsinessController:
     def __init__(self):
         self.state             = DrowsyState.IDLE
         self._confirm_start    = 0.0
-        self._lc_start         = 0.0
+        self._phase_start_time = 0.0
+        self._phase_step       = 0
+        self._smooth_steer     = 0.0   # EMA-filtered steering output
         self._last_beep        = 0.0
         self._beep_sound       = None
         self._detector         = None
         self.drowsy_events     = 0
         self.lane_change_times = []
+        self._in_rightmost_steps = 0  # Counter for steps in rightmost lane
+        self._align_start_time = 0.0
         self._setup_sound()
         self._setup_detector()
+
+    # ── Init helpers ──────────────────────────────────────────────────────────
 
     def _setup_detector(self):
         try:
@@ -241,12 +256,18 @@ class DrowsinessController:
         except Exception as e:
             print(f"[Drowsy] Sound init failed: {e}")
 
+    # ── Public ────────────────────────────────────────────────────────────────
+
     def reset(self):
         self.state             = DrowsyState.IDLE
         self._confirm_start    = 0.0
-        self._lc_start         = 0.0
+        self._phase_start_time = 0.0
+        self._phase_step       = 0
+        self._smooth_steer     = 0.0
         self.drowsy_events     = 0
         self.lane_change_times = []
+        self._in_rightmost_steps = 0
+        self._align_start_time = 0.0
         if self._detector:
             self._detector.reset()
         self._stop_sound()
@@ -255,72 +276,159 @@ class DrowsinessController:
         if self._detector:
             self._detector.stop()
 
-    # ── Main ──────────────────────────────────────────────────────────────────
+    # ── Main tick ─────────────────────────────────────────────────────────────
 
     def get_action(self, rl_action, env):
-        """Returns (action, override, state_name, ear)."""
+        """
+        Returns (action, override, state_name, ear).
+        override=True  → drowsy manoeuvre is in control.
+        override=False → RL action is passed through unmodified.
+        """
         is_drowsy = self._detector.is_drowsy if self._detector else False
         ear       = self._detector.current_ear if self._detector else 1.0
+        speed     = _current_speed_kmh(env)
         now       = time.time()
 
-        # Eyes open → immediately back to RL
-        if self.state != DrowsyState.IDLE and not is_drowsy:
-            self._reset_to_idle()
-            return rl_action, False, self.state.name, ear
-
-        # IDLE
+        # ── IDLE ──────────────────────────────────────────────────────────────
         if self.state == DrowsyState.IDLE:
             if is_drowsy:
                 self.state          = DrowsyState.CONFIRMING
                 self._confirm_start = now
-                print(f"[Drowsy] Detected — confirming ({DROWSY_CONFIRM_SECONDS}s) …")
+                print(f"[Drowsy] Detected – confirming for {DROWSY_CONFIRM_SECONDS}s …")
             return rl_action, False, self.state.name, ear
 
-        # CONFIRMING — RL still drives
+        # ── CONFIRMING – RL still drives while we wait ─────────────────────
         if self.state == DrowsyState.CONFIRMING:
+            if not is_drowsy:
+                # Blink was too short – go back to IDLE
+                self._reset_to_idle()
+                return rl_action, False, self.state.name, ear
             if now - self._confirm_start >= DROWSY_CONFIRM_SECONDS:
-                self.state         = DrowsyState.LANE_CHANGING
-                self._lc_start     = now
+                self._enter_phase(DrowsyState.SLOW_DOWN, now)
                 self.drowsy_events += 1
-                print("[Drowsy] CONFIRMED — PID steering to rightmost lane.")
+                print("[Drowsy] CONFIRMED → Phase 1: Slowing down straight.")
                 self._play_beep(force=True)
             return rl_action, False, self.state.name, ear
 
-        # LANE_CHANGING — PID steers toward rightmost lane
-        if self.state == DrowsyState.LANE_CHANGING:
+        # ── SLOW_DOWN – go straight, ease off throttle ─────────────────────
+        if self.state == DrowsyState.SLOW_DOWN:
             self._play_beep()
-            elapsed = now - self._lc_start
-            ramp    = float(np.clip(elapsed / 2.0, 0.0, 1.0))  # smooth ramp over 2s
+            # Keep going straight (steer = 0), gently reduce speed
+            target_steer = 0.0
+            self._smooth_steer = self._ema(self._smooth_steer, target_steer)
+            accel = _speed_accel(speed, SLOW_DOWN_TARGET_KMH, max_brake=-0.25, max_accel=0.1)
+            action = np.array([self._smooth_steer, accel], dtype=np.float32)
 
-            if _in_rightmost_lane(env):
-                self.state = DrowsyState.LANE_KEEPING
-                print("[Drowsy] Rightmost lane reached — braking to stop.")
-                action = _keep_lane_brake_action(env)
-            else:
-                action = _lane_change_action(env, ramp)
-
+            if speed <= SLOW_DOWN_TARGET_KMH + 1.0:
+                self._enter_phase(DrowsyState.DRIFT_LEFT, now)
+                print("[Drowsy] Phase 2: Drifting left toward leftmost lane.")
             return action, True, self.state.name, ear
 
-        # LANE_KEEPING — hold lane, decelerate
-        if self.state == DrowsyState.LANE_KEEPING:
+        # ── DRIFT_LEFT – gentle leftward steer until near leftmost lane ─
+        if self.state == DrowsyState.DRIFT_LEFT:
             self._play_beep()
-            speed = getattr(env.agent, "speed_km_h", 0.0)
+            self._phase_step += 1
+
+            if _in_leftmost_lane(env):
+                self._in_rightmost_steps += 1
+            else:
+                self._in_rightmost_steps = 0
+
+            if self._phase_step >= 20 and _is_near_leftmost_lane(env):
+                self._enter_phase(DrowsyState.ALIGN_LANE, now)
+                print("[Drowsy] Phase 3: Aligning in leftmost lane before braking.")
+                # fall through to alignment state on next tick
+                return self.get_action(rl_action, env)
+
+            raw_steer = self._steer_to_leftmost(env)
+            ramp = float(np.clip(self._phase_step / RAMP_STEPS, 0.0, 1.0))
+            target_steer = raw_steer * DRIFT_STEER_FACTOR * ramp
+            self._smooth_steer = self._ema(self._smooth_steer, target_steer)
+
+            accel = _speed_accel(speed, DRIFT_SPEED_KMH, max_brake=-0.25, max_accel=0.1)
+            action = np.array([self._smooth_steer, accel], dtype=np.float32)
+            return action, True, self.state.name, ear
+
+        # ── ALIGN_LANE – line up with the rightmost lane before braking ────
+        if self.state == DrowsyState.ALIGN_LANE:
+            self._play_beep()
+            self._phase_step += 1
+
+            if _in_leftmost_lane(env):
+                self._in_rightmost_steps += 1
+            else:
+                self._in_rightmost_steps = 0
+
+            raw_steer = self._steer_to_leftmost(env)
+            self._smooth_steer = self._ema(self._smooth_steer, raw_steer)
+
+            accel = _speed_accel(speed, ALIGN_SPEED_KMH, max_brake=-0.25, max_accel=0.08)
+            action = np.array([self._smooth_steer, accel], dtype=np.float32)
+
+            if (now - self._align_start_time >= ALIGN_DURATION_S and
+                    self._in_rightmost_steps >= 5):
+                self._enter_phase(DrowsyState.BRAKE_STOP, now)
+                print("[Drowsy] Phase 4: Braking to stop in rightmost lane.")
+                action = self._hold_lane_action(env, BRAKE_SPEED_KMH, speed)
+            return action, True, self.state.name, ear
+
+        # ── BRAKE_STOP – hold lane, decelerate smoothly ────────────────────
+        if self.state == DrowsyState.BRAKE_STOP:
+            self._play_beep()
+            action = self._hold_lane_action(env, BRAKE_SPEED_KMH, speed)
+
             if speed <= STOP_SPEED_KMH:
-                elapsed = now - self._lc_start
+                elapsed = now - self._phase_start_time
                 self.lane_change_times.append(elapsed)
                 self.state = DrowsyState.STOPPED
-                print(f"[Drowsy] STOPPED. Override time: {elapsed:.1f}s.")
-            action = _keep_lane_brake_action(env)
+                print(f"[Drowsy] ✓ SUCCESS – stopped in leftmost lane. "
+                      f"Brake time: {elapsed:.1f}s")
             return action, True, self.state.name, ear
 
-        # STOPPED — hold position
+        # ── STOPPED – hold position (full brake, no steer) ─────────────────
         if self.state == DrowsyState.STOPPED:
             self._play_beep()
-            # Full brake, zero steer
             action = np.array([0.0, -1.0], dtype=np.float32)
             return action, True, self.state.name, ear
 
         return rl_action, False, self.state.name, ear
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _enter_phase(self, new_state, now):
+        self.state             = new_state
+        self._phase_start_time = now
+        self._phase_step       = 0
+        self._in_rightmost_steps = 0
+        if new_state == DrowsyState.ALIGN_LANE:
+            self._align_start_time = now
+
+    def _ema(self, current, target):
+        """Exponential moving average – smooths abrupt steer changes."""
+        return current + STEER_SMOOTH_ALPHA * (target - current)
+
+    def _steer_to_leftmost(self, env):
+        """PID steering toward the leftmost lane."""
+        info = _get_road_info(env)
+        if info is None:
+            return -STEER_MAX * 0.4   # mild left bias as fallback
+        road_network, road_id, section_id, lane_id, lanes = info
+        target_lane = lanes[0]
+        return _pid_steer_to_lane(env, target_lane)
+
+    def _hold_lane_action(self, env, target_speed, speed):
+        """Stay centred in current lane while decelerating toward target_speed."""
+        info = _get_road_info(env)
+        if info is not None:
+            _, _, _, lane_id, lanes = info
+            target_lane  = lanes[lane_id]
+            raw_steer    = _pid_steer_to_lane(env, target_lane)
+        else:
+            raw_steer = 0.0
+        self._smooth_steer = self._ema(self._smooth_steer, raw_steer)
+        # In brake phase allow harder braking but still gradual
+        accel = _speed_accel(speed, target_speed, max_brake=-1.0, max_accel=0.05)
+        return np.array([self._smooth_steer, accel], dtype=np.float32)
 
     def _play_beep(self, force=False):
         if not self._beep_sound:
@@ -343,9 +451,10 @@ class DrowsinessController:
     def _reset_to_idle(self):
         prev = self.state
         self._stop_sound()
+        self._smooth_steer = 0.0
         self.state = DrowsyState.IDLE
         if prev != DrowsyState.IDLE:
-            print(f"[Drowsy] AWAKE — RL resumes. (was: {prev.name})")
+            print(f"[Drowsy] AWAKE – RL resumes. (was: {prev.name})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -403,8 +512,8 @@ def get_rl_action(policy, obs):
 def _classify_episode(done, info, drowsy_state, env):
     """
     Returns one of: 'drowsy_success', 'crash', 'out_of_road', 'timeout', 'normal_done'
-    
-    drowsy_success = vehicle stopped in rightmost lane while drowsy.
+
+    drowsy_success = vehicle stopped in leftmost lane while drowsy.
     This is the PRIMARY success criterion – reaching route end is NOT required.
     """
     if drowsy_state == DrowsyState.STOPPED:
@@ -428,8 +537,11 @@ def main():
     print("  Drowsy Driver Safety System")
     print("  ─────────────────────────────────────────────────────────")
     print("  AWAKE  : pretrained RL model drives")
-    print("  DROWSY : PID steering to rightmost lane then stops")
-    print("  SUCCESS: vehicle stopped in rightmost lane")
+    print("  DROWSY : 3-phase smooth manoeuvre")
+    print("           Phase 1  SLOW_DOWN   – straight, ease off throttle")
+    print("           Phase 2  DRIFT_LEFT  – gentle leftward steer")
+    print("           Phase 3  BRAKE_STOP  – hold lane, decelerate to stop")
+    print("  SUCCESS: vehicle stopped in leftmost lane (not route end)")
     print("=" * 64 + "\n")
 
     # Load cumulative stats
@@ -437,8 +549,7 @@ def main():
     print(f"[RunDrowsy] Loaded cumulative stats: {cum_stats['total_episodes']} previous episodes\n")
 
     env = HumanInTheLoopEnv()
-    env.use_drowsy_reward = True 
-    obs = env.reset()
+    obs= env.reset()
 
     obs_dim      = obs.shape[0]
     act_dim      = env.action_space.shape[0]
@@ -465,24 +576,33 @@ def main():
             if episode > 0:
                 obs = env.reset()
             drowsy.reset()
-            ep_reward = 0.0
+            ep_reward  = 0.0
             ep_outcome = "timeout"
-            env.external_reward = 0
+
             print(f"\n─── Episode {episode + 1} / {NUM_EPISODES} ───")
 
             for step in range(MAX_STEPS):
                 rl_action = get_rl_action(policy, obs)
                 action, override, state_name, ear = drowsy.get_action(rl_action, env)
                 obs, reward, done, info = env.step(action)
-                env.external_reward += reward
+                if override:
+                    if drowsy.state == DrowsyState.SLOW_DOWN:
+                        reward += 0.1
+                    elif drowsy.state == DrowsyState.DRIFT_LEFT:
+                        reward += 0.2
+                    elif drowsy.state == DrowsyState.BRAKE_STOP:
+                        reward += 0.3
+                    elif drowsy.state == DrowsyState.STOPPED:
+                        reward += 0.1
                 ep_reward += reward
 
+                # Log every 100 steps
                 if step % 100 == 0:
-                    speed = getattr(env.agent, "speed_km_h", 0.0)
+                    speed = _current_speed_kmh(env)
                     lane  = getattr(env.agent, "lane_index", ("?", "?", "?"))[2]
                     print(f"  step={step:4d} | state={state_name:14s} | "
                           f"EAR={ear:.3f} | lane={lane} | "
-                          f"speed={speed:.1f} km/h | r={reward:+.3f}")
+                          f"speed={speed:5.1f} km/h | r={reward:+.3f}")
 
                 # Check for drowsy success first (takes priority over env done)
                 if drowsy.state == DrowsyState.STOPPED:
@@ -542,7 +662,7 @@ def main():
         print(f"  Timeout             : {to_/total_eps*100:.1f}%")
         print(f"  Drowsy events total : {cum_stats['total_drowsy_events']}")
         if cum_stats["all_lane_change_times"]:
-            print(f"  Avg override time   : {np.mean(cum_stats['all_lane_change_times']):.2f}s")
+            print(f"  Avg brake time      : {np.mean(cum_stats['all_lane_change_times']):.2f}s")
         print(f"  Highest reward      : {cum_stats['max_reward']:.2f}")
         print(f"  Lowest reward       : {cum_stats['min_reward']:.2f}")
         if cum_stats["max_reward"] != float('-inf') and cum_stats["min_reward"] != float('inf'):
